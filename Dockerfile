@@ -24,4 +24,5 @@ ENV PYTHONUNBUFFERED=1
 # Render set PORT masa runtime; gunicorn ikut PORT
 EXPOSE 10000
 
-CMD ["sh", "-c", "exec gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --timeout 300 --workers 1 --threads 1"]
+# Long YouTube URL: download + ffmpeg + librosa can exceed 300s on free tier CPU.
+CMD ["sh", "-c", "exec gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --timeout 900 --workers 1 --threads 1"]
