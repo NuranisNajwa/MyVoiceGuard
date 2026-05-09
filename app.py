@@ -373,6 +373,14 @@ try:
     import yt_dlp
     YTDLP_OK = True
     print("[OK] yt-dlp OK")
+    _deno = shutil.which("deno")
+    if _deno:
+        print(f"[OK] deno in PATH (yt-dlp YouTube EJS): {_deno}")
+    else:
+        print(
+            "[WARN] deno not in PATH — YouTube URL mode may fail JS challenges; "
+            "Dockerfile should install Deno (see EJS wiki)."
+        )
 except ImportError:
     YTDLP_OK = False
     print("[WARN] yt-dlp missing (needed for YouTube/TikTok)")
