@@ -6,10 +6,28 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("NUMBA_NUM_THREADS", "1")
-# Avoid heavy Numba JIT compilation on low-memory Render workers.
-# Can be overridden with MV_ENABLE_NUMBA_JIT=1 on larger instances.
-if os.environ.get("MV_ENABLE_NUMBA_JIT", "").strip().lower() not in ("1", "true", "yes", "on"):
+# Librosa MFCC uses Numba; forcing NUMBA_DISABLE_JIT=1 breaks many Linux stacks with
+# AttributeError: 'function' object has no attribute 'get_call_template'.
+# Default: leave JIT enabled so MFCC matches train_model.py. If a worker OOMs on first
+# compile, set MV_NUMBA_DISABLE_JIT=1 (or use a paid instance + MV_HIGH_MEMORY=1).
+_legacy_jit_on = os.environ.get("MV_ENABLE_NUMBA_JIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_force_numba_off = os.environ.get("MV_NUMBA_DISABLE_JIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+if _legacy_jit_on:
+    os.environ.pop("NUMBA_DISABLE_JIT", None)
+elif _force_numba_off:
     os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+else:
+    os.environ.pop("NUMBA_DISABLE_JIT", None)
 
 # Framework mode: keep inference aligned with train_model.py pipeline by default.
 # (MFCC + delta + spectral extras + RF decision), avoid heuristic overrides.
@@ -128,6 +146,12 @@ SPEAKER_REF_MIN_SIMILARITY = 0.30
 SPEAKER_REF_SECOND_AMBIGUOUS = 0.42
 SPEAKER_REF_AMBIGUITY_MARGIN = 0.028
 MAX_FILE_SIZE  = 50 * 1024 * 1024  # 50 MB
+# Reject empty/corrupt browser uploads (often shows as 0.1KB); ffmpeg then says "Invalid data".
+try:
+    MIN_AUDIO_UPLOAD_BYTES = int(os.environ.get("MV_MIN_AUDIO_UPLOAD_BYTES", "400").strip() or "400")
+except ValueError:
+    MIN_AUDIO_UPLOAD_BYTES = 400
+MIN_AUDIO_UPLOAD_BYTES = max(64, min(MIN_AUDIO_UPLOAD_BYTES, 10240))
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
@@ -365,7 +389,15 @@ def _yt_dlp_youtube_extractor_args():
     YouTube often needs non-web clients when no Node/Deno JS runtime is installed.
     See: https://github.com/yt-dlp/yt-dlp/wiki/EJS
     """
-    return {"youtube": {"player_client": ["android", "web", "mweb"]}}
+    return {"youtube": {"player_client": ["android", "ios", "web", "mweb"]}}
+
+
+def _yt_dlp_cookie_opts():
+    """Optional cookies.txt for YouTube bot blocks (set MV_YTDLP_COOKIEFILE on Render)."""
+    p = (os.environ.get("MV_YTDLP_COOKIEFILE") or "").strip()
+    if p and os.path.isfile(p):
+        return {"cookiefile": p}
+    return {}
 
 
 def _youtube_oembed_title(url: str) -> str:
@@ -504,6 +536,13 @@ def _parse_youtube_start_seconds(url: str) -> float:
 # =========================
 def convert_to_wav(input_path, output_path):
     print(f"[CONVERT] {input_path} -> {output_path}")
+    try:
+        sz = os.path.getsize(input_path)
+        if sz < MIN_AUDIO_UPLOAD_BYTES:
+            print(f"[CONVERT] input too small ({sz} bytes) — not valid audio")
+            return False
+    except OSError:
+        pass
     ext = os.path.splitext(input_path)[1].lower()
     compressed = ext in (".mp3", ".m4a", ".aac", ".webm", ".ogg", ".opus", ".flac")
 
@@ -1902,6 +1941,16 @@ def predict_file():
         print(f"[UPLOAD] {file.filename}  {size/1024:.1f}KB  {file.content_type}")
         if size > MAX_FILE_SIZE:
             return jsonify({"error": f"File too large ({size/1024/1024:.1f} MB, max 50 MB)"}), 400
+        if size < MIN_AUDIO_UPLOAD_BYTES:
+            return jsonify(
+                {
+                    "error": (
+                        f"File too small ({size} bytes) — looks empty or corrupt. "
+                        "Pick the audio again in the file picker, or re-download the clip. "
+                        "If using mobile, wait until the file finishes copying."
+                    )
+                }
+            ), 400
 
         # --- Extension check ---
         ext = os.path.splitext(file.filename)[1].lower()
@@ -2044,6 +2093,7 @@ def predict_url():
                 "skip_download": True,
                 "noplaylist": True,
                 "extractor_args": _yt_dlp_youtube_extractor_args(),
+                **_yt_dlp_cookie_opts(),
             }
             try:
                 with yt_dlp.YoutubeDL(meta_opts) as ydl:
@@ -2092,9 +2142,26 @@ def predict_url():
                 "retries": 5,
                 "fragment_retries": 5,
                 "extractor_args": _yt_dlp_youtube_extractor_args(),
+                **_yt_dlp_cookie_opts(),
             }
-            with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([url])
+            try:
+                with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as dl_err:
+                err_s = str(dl_err)
+                if "Sign in to confirm" in err_s or "not a bot" in err_s.lower():
+                    return jsonify(
+                        {
+                            "error": (
+                                "YouTube blocked this server (sign-in / bot check). "
+                                "Easiest: download the video on your PC, then use Upload. "
+                                "Advanced: export cookies.txt (see yt-dlp wiki), upload to a "
+                                "private path on the server and set env MV_YTDLP_COOKIEFILE to that path."
+                            ),
+                            "youtube_bot_block": True,
+                        }
+                    ), 503
+                raise
 
             for f in os.listdir(temp_folder):
                 if f.startswith(f"yt_{uid}"):
@@ -2276,11 +2343,13 @@ def predict_live():
         t_live = time.time()
         # When the user does not speak, Web Speech often returns "" — the RF still
         # scores ~90% REAL on room noise. Skip the model unless disabled via env.
-        skip_no_tr = os.environ.get("MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT", "1").strip().lower() not in (
+        # Default OFF: run RF on audio even when Web Speech returns "" (user expects voice analysis).
+        # Set MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT=1 if you want to block model on empty transcript (noise guard).
+        skip_no_tr = os.environ.get("MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT", "0").strip().lower() not in (
             "0", "false", "no", "off",
         )
         if skip_no_tr and not transcript:
-            print("[LIVE] Empty transcript -> 0% FAKE (no model). MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT=0 to allow.")
+            print("[LIVE] Empty transcript -> 0% FAKE (no model). Set MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT=0 to run RF on audio.")
             safe_remove(in_path, wav_path)
             return jsonify(
                 {
@@ -2299,7 +2368,7 @@ def predict_live():
                     "speech_gate_message": (
                         "No speech was recognized. Speak clearly near the microphone, then try again. "
                         "If you are speaking in another language, your server may need "
-                        "MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT=0 so analysis can use audio only."
+                        "Clear MV_LIVE_SKIP_MODEL_IF_NO_TRANSCRIPT (default) so analysis uses audio when transcript is empty."
                     ),
                 }
             )
