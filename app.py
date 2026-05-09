@@ -384,12 +384,25 @@ except ImportError:
     REQUESTS_OK = False
 
 
-def _yt_dlp_youtube_extractor_args():
+def _yt_dlp_youtube_client_profiles():
     """
-    YouTube often needs non-web clients when no Node/Deno JS runtime is installed.
-    See: https://github.com/yt-dlp/yt-dlp/wiki/EJS
+    Ordered player_client lists to try when YouTube returns bot / sign-in errors.
+    yt-dlp picks the first working client; order matters. Updated as YouTube changes APIs.
     """
-    return {"youtube": {"player_client": ["android", "ios", "web", "mweb"]}}
+    raw = (os.environ.get("MV_YTDLP_PLAYER_CLIENTS") or "").strip()
+    if raw:
+        # e.g. "android,web,tv_embedded" -> one profile [["android","web","tv_embedded"]]
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if parts:
+            return [parts]
+    return [
+        ["android", "ios", "web", "mweb"],
+        ["android", "web"],
+        ["tv_embedded", "web"],
+        ["ios", "mweb"],
+        ["mweb", "android"],
+        ["web"],
+    ]
 
 
 def _yt_dlp_cookie_opts():
@@ -398,6 +411,164 @@ def _yt_dlp_cookie_opts():
     if p and os.path.isfile(p):
         return {"cookiefile": p}
     return {}
+
+
+def _prepare_ytdlp_cookiefile(source_path: str, uid_suffix: str):
+    """
+    Copy secret cookies to temp with UTF-8 + LF only (fixes Windows CRLF / BOM).
+    Validates Netscape header yt-dlp requires. Returns (out_path_or_none, error_or_none).
+    """
+    if not source_path:
+        return None, None
+    if not os.path.isfile(source_path):
+        return None, (
+            f"MV_YTDLP_COOKIEFILE path is not a file on this server: {source_path!r}. "
+            "Check Render Secret File name → use /etc/secrets/<that_filename>."
+        )
+    try:
+        raw = open(source_path, "rb").read()
+    except OSError as e:
+        return None, f"Cannot read cookie file: {e}"
+    if not raw.strip():
+        return None, "Cookie file is empty."
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    text = raw.decode("utf-8", errors="replace")
+    lines = [ln.rstrip("\r") for ln in text.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return None, "Cookie file has no content."
+    first = " ".join(lines[0].strip().split()).lower()
+    ok = first in ("# http cookie file", "# netscape http cookie file") or first.startswith(
+        "# netscape http cookie file"
+    )
+    if not ok:
+        return (
+            None,
+            "Cookies file is not valid Netscape format for yt-dlp (wrong header line). "
+            "In Get cookies.txt LOCALLY set Export Format to Netscape (not JSON), export again, "
+            "re-upload the Secret File on Render, redeploy.",
+        )
+    out = os.path.join(temp_folder, f"netscape_cookies_{uid_suffix}.txt")
+    try:
+        with open(out, "w", encoding="utf-8", newline="\n") as fo:
+            fo.write("\n".join(lines) + "\n")
+    except OSError as e:
+        return None, f"Cannot write normalized cookie file: {e}"
+    return out, None
+
+
+def _is_youtube_bot_block_message(msg: str) -> bool:
+    if not msg:
+        return False
+    low = msg.lower()
+    if "sign in to confirm" in low:
+        return True
+    if "not a bot" in low:
+        return True
+    if "confirm you're not a bot" in low:
+        return True
+    if "login required" in low and "youtube" in low:
+        return True
+    return False
+
+
+def _youtube_cleanup_temp_yt_files(uid: str):
+    """Remove partial yt-dlp outputs before the next player_client attempt."""
+    try:
+        for f in os.listdir(temp_folder):
+            if f.startswith(f"yt_{uid}."):
+                safe_remove(os.path.join(temp_folder, f))
+    except OSError:
+        pass
+
+
+def _youtube_ytdlp_meta_best_effort(url: str, cookie_opts=None):
+    """Try several YouTube player clients; returns info dict or None."""
+    if cookie_opts is None:
+        cookie_opts = _yt_dlp_cookie_opts()
+    profiles = _yt_dlp_youtube_client_profiles()
+    for idx, clients in enumerate(profiles):
+        meta_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "extractor_args": {"youtube": {"player_client": clients}},
+            **cookie_opts,
+        }
+        try:
+            with yt_dlp.YoutubeDL(meta_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if isinstance(info, dict):
+                print(f"[URL] yt-dlp metadata OK (profile {idx + 1}/{len(profiles)}) player_client={clients!r}")
+                return info
+        except Exception as e:
+            print(f"[URL] yt-dlp metadata profile {idx + 1}/{len(profiles)} failed: {e}")
+    return None
+
+
+def _youtube_ytdlp_download_best_effort(url: str, tmpl: str, uid: str, cookie_opts=None):
+    """
+    Try download with each player_client profile. Returns:
+      (path_or_none, last_error_str, youtube_bot_block)
+    """
+    if cookie_opts is None:
+        cookie_opts = _yt_dlp_cookie_opts()
+    profiles = _yt_dlp_youtube_client_profiles()
+    ua = (os.environ.get("MV_YTDLP_USER_AGENT") or "").strip()
+    extra = {**cookie_opts}
+    if ua:
+        extra["http_headers"] = {"User-Agent": ua}
+    last_err = ""
+    last_bot = False
+    min_bytes = 8000
+    for idx, clients in enumerate(profiles):
+        _youtube_cleanup_temp_yt_files(uid)
+        dl_opts = {
+            "format": (
+                "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/"
+                "ba/bestaudio/best/ba/best"
+            ),
+            "outtmpl": tmpl,
+            "quiet": True,
+            "noplaylist": True,
+            "retries": 3,
+            "fragment_retries": 5,
+            "socket_timeout": 45,
+            "extractor_args": {"youtube": {"player_client": clients}},
+            **extra,
+        }
+        try:
+            print(
+                f"[URL] yt-dlp download attempt {idx + 1}/{len(profiles)} "
+                f"player_client={clients!r}"
+            )
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            last_err = str(e)
+            last_bot = _is_youtube_bot_block_message(last_err)
+            print(f"[URL] yt-dlp download failed: {last_err!r}")
+            continue
+        found = None
+        try:
+            for f in os.listdir(temp_folder):
+                if f.startswith(f"yt_{uid}."):
+                    p = os.path.join(temp_folder, f)
+                    if os.path.isfile(p) and os.path.getsize(p) >= min_bytes:
+                        found = p
+                        break
+                    safe_remove(p)
+        except OSError as oe:
+            last_err = str(oe)
+            continue
+        if found:
+            print(f"[URL] yt-dlp download OK with player_client={clients!r}")
+            return found, "", False
+        last_err = "No usable output file after yt-dlp download"
+    return None, last_err, last_bot or _is_youtube_bot_block_message(last_err)
 
 
 def _youtube_oembed_title(url: str) -> str:
@@ -2082,118 +2253,110 @@ def predict_url():
             if not YTDLP_OK:
                 return jsonify({"error": "yt-dlp not installed: pip install yt-dlp"}), 500
 
-            video_title = ""
-            uploader = ""
-            description = ""
-            # ------------------------------------------------------------------
-            # Title + politician hint: yt-dlp metadata, then oEmbed fallback
-            # ------------------------------------------------------------------
-            meta_opts = {
-                "quiet": True,
-                "skip_download": True,
-                "noplaylist": True,
-                "extractor_args": _yt_dlp_youtube_extractor_args(),
-                **_yt_dlp_cookie_opts(),
-            }
+            yt_cookie_norm_path = None
+            yt_cookie_opts = {}
+            src_cookie = (os.environ.get("MV_YTDLP_COOKIEFILE") or "").strip()
+            if src_cookie:
+                prep, cerr = _prepare_ytdlp_cookiefile(src_cookie, uid)
+                if cerr:
+                    return jsonify({"error": cerr, "cookies_file_invalid": True}), 400
+                yt_cookie_norm_path = prep
+                yt_cookie_opts = {"cookiefile": prep}
+
             try:
-                with yt_dlp.YoutubeDL(meta_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                video_title = ""
+                uploader = ""
+                description = ""
+                # ------------------------------------------------------------------
+                # Title + politician hint: yt-dlp metadata (multi client), then oEmbed
+                # ------------------------------------------------------------------
+                info = _youtube_ytdlp_meta_best_effort(url, yt_cookie_opts)
+                if info:
                     video_title = (info.get("title") or "").strip()
                     uploader = (info.get("uploader") or "").strip()
                     description = ((info.get("description") or "")[:300]).strip()
                     print(f"[URL] yt-dlp title: {video_title!r} uploader: {uploader!r}")
-            except Exception as e:
-                print(f"[URL] yt-dlp metadata extraction failed: {e}")
+                else:
+                    print("[URL] yt-dlp metadata extraction failed on all player_client profiles")
 
-            if not video_title:
-                video_title = _youtube_oembed_title(url)
-                if video_title:
-                    print(f"[URL] oEmbed title: {video_title!r}")
+                if not video_title:
+                    video_title = _youtube_oembed_title(url)
+                    if video_title:
+                        print(f"[URL] oEmbed title: {video_title!r}")
 
-            meta_text = f"{video_title} {uploader} {description}"
-            if name_hint is None:
-                name_hint = detect_politician_from_text(meta_text)
-                print(f"[URL] name_hint from video meta: {name_hint}")
+                meta_text = f"{video_title} {uploader} {description}"
+                if name_hint is None:
+                    name_hint = detect_politician_from_text(meta_text)
+                    print(f"[URL] name_hint from video meta: {name_hint}")
 
-            # region agent log
-            _agent_debug_log(
-                "H2_H3",
-                "predict_url:after_meta",
-                "youtube_meta_and_hint",
-                {
-                    "url_has_start_param": ("t=" in url or "start=" in url.lower()),
-                    "parsed_yt_start_sec": yt_audio_start_sec,
-                    "video_title_len": len(video_title or ""),
-                    "video_title_snip": (video_title or "")[:100],
-                    "name_hint": name_hint,
-                },
-            )
-            # endregion
-
-            tmpl = os.path.join(temp_folder, f"yt_{uid}.%(ext)s")
-            dl_opts = {
-                "format": (
-                    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/"
-                    "ba/bestaudio/best/ba/best"
-                ),
-                "outtmpl": tmpl,
-                "quiet": True,
-                "noplaylist": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "extractor_args": _yt_dlp_youtube_extractor_args(),
-                **_yt_dlp_cookie_opts(),
-            }
-            try:
-                with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                    ydl.download([url])
-            except Exception as dl_err:
-                err_s = str(dl_err)
-                if "Sign in to confirm" in err_s or "not a bot" in err_s.lower():
-                    return jsonify(
-                        {
-                            "error": (
-                                "YouTube blocked this server (sign-in / bot check). "
-                                "Easiest: download the video on your PC, then use Upload. "
-                                "Advanced: export cookies.txt (see yt-dlp wiki), upload to a "
-                                "private path on the server and set env MV_YTDLP_COOKIEFILE to that path."
-                            ),
-                            "youtube_bot_block": True,
-                        }
-                    ), 503
-                raise
-
-            for f in os.listdir(temp_folder):
-                if f.startswith(f"yt_{uid}"):
-                    downloaded = os.path.join(temp_folder, f)
-                    break
-
-            if downloaded and os.path.isfile(downloaded):
-                sz = os.path.getsize(downloaded)
-                print(f"[URL] Downloaded bytes: {sz}")
                 # region agent log
                 _agent_debug_log(
-                    "H1",
-                    "predict_url:after_download",
-                    "yt_download",
+                    "H2_H3",
+                    "predict_url:after_meta",
+                    "youtube_meta_and_hint",
                     {
-                        "size_bytes": sz,
-                        "ext": os.path.splitext(downloaded)[1].lower(),
-                        "basename": os.path.basename(downloaded),
+                        "url_has_start_param": ("t=" in url or "start=" in url.lower()),
+                        "parsed_yt_start_sec": yt_audio_start_sec,
+                        "video_title_len": len(video_title or ""),
+                        "video_title_snip": (video_title or "")[:100],
+                        "name_hint": name_hint,
                     },
                 )
                 # endregion
-                if sz < 8000:
-                    safe_remove(downloaded)
+
+                tmpl = os.path.join(temp_folder, f"yt_{uid}.%(ext)s")
+                downloaded, dl_err, yt_bot = _youtube_ytdlp_download_best_effort(
+                    url, tmpl, uid, yt_cookie_opts
+                )
+                if not downloaded:
+                    if yt_bot or _is_youtube_bot_block_message(dl_err or ""):
+                        return jsonify(
+                            {
+                                "error": (
+                                    "YouTube blocked this server (sign-in / bot check). "
+                                    "Easiest: download the video on your PC, then use Upload. "
+                                    "Advanced: export cookies.txt (see yt-dlp wiki), upload to a "
+                                    "private path on the server and set env MV_YTDLP_COOKIEFILE to that path."
+                                ),
+                                "youtube_bot_block": True,
+                            }
+                        ), 503
                     return jsonify(
                         {
                             "error": (
-                                "YouTube download was too small (broken link, private video, "
-                                "or wrong URL). Copy the full watch URL from the browser bar "
-                                "(watch for typos: I vs l in the video id)."
+                                f"YouTube download failed after trying multiple clients: {dl_err or 'unknown'}"
                             )
                         }
-                    ), 400
+                    ), 502
+
+                if downloaded and os.path.isfile(downloaded):
+                    sz = os.path.getsize(downloaded)
+                    print(f"[URL] Downloaded bytes: {sz}")
+                    # region agent log
+                    _agent_debug_log(
+                        "H1",
+                        "predict_url:after_download",
+                        "yt_download",
+                        {
+                            "size_bytes": sz,
+                            "ext": os.path.splitext(downloaded)[1].lower(),
+                            "basename": os.path.basename(downloaded),
+                        },
+                    )
+                    # endregion
+                    if sz < 8000:
+                        safe_remove(downloaded)
+                        return jsonify(
+                            {
+                                "error": (
+                                    "YouTube download was too small (broken link, private video, "
+                                    "or wrong URL). Copy the full watch URL from the browser bar "
+                                    "(watch for typos: I vs l in the video id)."
+                                )
+                            }
+                        ), 400
+            finally:
+                safe_remove(yt_cookie_norm_path)
 
         else:
             if not REQUESTS_OK:
