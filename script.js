@@ -570,8 +570,14 @@ function showResult(data) {
     if (label === "REAL") color = "#00ff66";
     else color = "#ff4444";
 
-    document.getElementById("accuracyText").innerHTML =
-        `${confidence.toFixed(1)}%<br>Accuracy<br>Voice`;
+    let accLine = `${confidence.toFixed(1)}%<br>Accuracy<br>Voice`;
+    if (data.model_inference_failed) {
+        accLine = `—<br><span style="font-size:0.85em">Model pipeline failed</span><br>Voice`;
+    } else if (typeof data.raw_prob_real === "number" && !Number.isNaN(data.raw_prob_real)) {
+        accLine +=
+            `<br><span style="font-size:0.75em;opacity:0.85">P(REAL): ${(100 * data.raw_prob_real).toFixed(1)}%</span>`;
+    }
+    document.getElementById("accuracyText").innerHTML = accLine;
     document.getElementById("timeText").innerHTML =
         `Time to detect:<br>${data.time || 0} Seconds`;
     document.getElementById("sourceText").innerText =
@@ -587,11 +593,16 @@ function showResult(data) {
     }
 
     loadPolitician(data.person || "unknown");
+    const info = document.getElementById("personInfo");
     if (data.insufficient_speech && data.speech_gate_message) {
-        const info = document.getElementById("personInfo");
-        if (info) {
-            info.innerText = data.speech_gate_message;
-        }
+        if (info) info.innerText = data.speech_gate_message;
+    } else if (data.model_inference_failed && data.model_error && info) {
+        info.innerText =
+            "Model inference did not complete. Check Render logs. Detail: " +
+            String(data.model_error).slice(0, 280);
+    } else if (data.signature_based_fake && info) {
+        info.innerText =
+            "Filename matched a synthetic/deepfake keyword (signature layer). Rename the file if this is genuine news audio.";
     }
     // #region agent log
     if (data.insufficient_speech) {
