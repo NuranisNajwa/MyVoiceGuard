@@ -2,7 +2,7 @@
 // CONFIG
 // =========================
 // Production API (Flask on Render). Tukar URL ini jika subdomain Render / custom domain lain.
-const MVG_PRODUCTION_API = "https://myvoiceguard-1.onrender.com";
+const MVG_PRODUCTION_API = "https://myvoiceguard.onrender.com";
 
 const API_URL = (() => {
     const host = (typeof window !== "undefined" && window.location && window.location.hostname) || "";
