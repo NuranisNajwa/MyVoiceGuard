@@ -746,6 +746,22 @@ def _parse_youtube_start_seconds(url: str) -> float:
 # =========================
 # AUDIO CONVERSION
 # =========================
+def _convert_max_decode_seconds():
+    """
+    Max seconds to decode from the start of the file (RAM / wall-time on long YouTube rips).
+    MV_CONVERT_MAX_AUDIO_SEC overrides. On RENDER/low-memory hosts default 300s.
+    """
+    raw = os.environ.get("MV_CONVERT_MAX_AUDIO_SEC", "").strip()
+    if raw:
+        try:
+            return float(max(30.0, min(900.0, float(raw))))
+        except ValueError:
+            pass
+    if _infer_low_memory_mode():
+        return 300.0
+    return None
+
+
 def convert_to_wav(input_path, output_path):
     print(f"[CONVERT] {input_path} -> {output_path}")
     try:
@@ -756,7 +772,19 @@ def convert_to_wav(input_path, output_path):
     except OSError:
         pass
     ext = os.path.splitext(input_path)[1].lower()
-    compressed = ext in (".mp3", ".m4a", ".aac", ".webm", ".ogg", ".opus", ".flac")
+    # Include video containers (yt-dlp often saves bestaudio inside .mp4).
+    compressed = ext in (
+        ".mp3",
+        ".m4a",
+        ".aac",
+        ".webm",
+        ".ogg",
+        ".opus",
+        ".flac",
+        ".mp4",
+        ".m4v",
+        ".mkv",
+    )
 
     # Prefer ffmpeg first for compressed audio when available (Render Python image often lacks it;
     # Docker image in this repo installs ffmpeg — see Dockerfile / render.yaml).
@@ -764,21 +792,19 @@ def convert_to_wav(input_path, output_path):
         try:
             import subprocess
 
+            cap = _convert_max_decode_seconds()
+            ff_cmd = ["ffmpeg", "-y", "-i", input_path]
+            if cap is not None:
+                ff_cmd.extend(["-t", str(int(cap))])
+                print(f"[CONVERT] ffmpeg decode cap: first {int(cap)}s (set MV_CONVERT_MAX_AUDIO_SEC to change)")
+            ff_cmd.extend(["-ar", "16000", "-ac", "1", output_path])
+            ff_timeout = 900 if cap is None else min(900, max(180, int(cap) * 3))
+
             result = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    input_path,
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-                    output_path,
-                ],
+                ff_cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=ff_timeout,
             )
             if result.returncode == 0:
                 print("[CONVERT] ffmpeg (preferred for compressed) OK")
@@ -791,6 +817,12 @@ def convert_to_wav(input_path, output_path):
         try:
             audio = AudioSegment.from_file(input_path)
             audio = audio.set_frame_rate(16000).set_channels(1)
+            cap = _convert_max_decode_seconds()
+            if cap is not None:
+                max_ms = int(cap * 1000)
+                if len(audio) > max_ms:
+                    audio = audio[:max_ms]
+                    print(f"[CONVERT] pydub trimmed to {cap:.0f}s (decode cap)")
             audio.export(output_path, format="wav")
             print(f"[CONVERT] pydub OK  ({len(audio)/1000:.1f}s)")
             return True
@@ -801,17 +833,10 @@ def convert_to_wav(input_path, output_path):
         try:
             import soundfile as sf
 
-            conv_raw = os.environ.get("MV_CONVERT_MAX_AUDIO_SEC", "").strip()
-            if conv_raw:
-                try:
-                    cmax = float(max(10.0, min(600.0, float(conv_raw))))
-                except ValueError:
-                    cmax = None
-            else:
-                cmax = 120.0 if _infer_low_memory_mode() else None
+            cmax = _convert_max_decode_seconds()
             if cmax is not None:
                 y, _ = librosa.load(input_path, sr=16000, mono=True, duration=cmax)
-                print(f"[CONVERT] librosa decode capped at {cmax}s (low-memory host)")
+                print(f"[CONVERT] librosa decode capped at {cmax}s")
             else:
                 y, _ = librosa.load(input_path, sr=16000, mono=True)
             sf.write(output_path, y, 16000)
@@ -822,9 +847,15 @@ def convert_to_wav(input_path, output_path):
 
     try:
         import subprocess
+        cap = _convert_max_decode_seconds()
+        ff_cmd = ["ffmpeg", "-y", "-i", input_path]
+        if cap is not None:
+            ff_cmd.extend(["-t", str(int(cap))])
+        ff_cmd.extend(["-ar", "16000", "-ac", "1", output_path])
+        ff_timeout = 900 if cap is None else min(900, max(120, int(cap) * 3))
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", output_path],
-            capture_output=True, text=True, timeout=60,
+            ff_cmd,
+            capture_output=True, text=True, timeout=ff_timeout,
         )
         if result.returncode == 0:
             print("[CONVERT] ffmpeg subprocess OK")
