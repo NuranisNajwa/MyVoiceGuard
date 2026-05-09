@@ -627,11 +627,17 @@ def _features_from_audio_y(y, sr=16000):
         ])
         return np.concatenate([mfcc_mean, mfcc_std, delta_mean, extra])
     except Exception as e:
-        # Render + Python 3.14 may hit librosa/numba incompat ("get_call_template").
-        # Fallback keeps inference dynamic using lightweight NumPy-only features.
-        if not allow_numpy_fallback:
-            raise
-        print(f"[FEATURES] librosa feature path failed, using numpy fallback: {e}")
+        # Render/Linux often hits librosa↔numba issues ('get_call_template'). When strict
+        # mode disables MV_ALLOW_NUMPY_FEATURE_FALLBACK, re-raising used to zero-out features
+        # and break the whole pipeline — never do that; emergency fallback keeps RF scoring.
+        msg = str(e)
+        if allow_numpy_fallback:
+            print(f"[FEATURES] librosa MFCC failed, numpy fallback (opt-in): {msg[:200]}")
+        else:
+            print(
+                "[FEATURES] librosa MFCC failed; EMERGENCY numpy 44-dim fallback "
+                f"(strict_framework={MV_STRICT_FRAMEWORK}). Fix deps for true MFCC parity: {msg[:200]}"
+            )
         return _features_from_audio_y_numpy_fallback(y, sr)
 
 
@@ -702,7 +708,12 @@ def _features_from_audio_y_numpy_fallback(y, sr=16000):
 def extract_features(wav_path):
     """First 30s only — used for short reference_voice clips and speaker cosine."""
     if not LIBROSA_OK:
-        return np.zeros(44)
+        try:
+            y, sr = _load_audio_mono_16k(wav_path, duration_sec=30.0)
+            return _features_from_audio_y_numpy_fallback(y, sr)
+        except Exception as e:
+            print(f"[FEATURES] no librosa + fallback failed: {e}")
+            return np.zeros(44)
     try:
         y, sr = _load_audio_mono_16k(wav_path, duration_sec=30.0)
         feats = _features_from_audio_y(y, sr)
@@ -710,7 +721,14 @@ def extract_features(wav_path):
         return feats
     except Exception as e:
         print(f"[FEATURES] Error: {e}")
-        return np.zeros(44)
+        try:
+            y, sr = _load_audio_mono_16k(wav_path, duration_sec=30.0)
+            fb = _features_from_audio_y_numpy_fallback(y, sr)
+            print(f"[FEATURES] wav-path emergency numpy fallback norm={np.linalg.norm(fb):.2f}")
+            return fb
+        except Exception as e2:
+            print(f"[FEATURES] emergency fallback failed: {e2}")
+            return np.zeros(44)
 
 
 def _segment_audio_chunks(y_full, sr=16000):
