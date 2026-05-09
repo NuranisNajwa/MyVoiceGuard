@@ -2,8 +2,9 @@
 # Jangan guna "Native Python" sahaja — imej itu biasanya tiada ffmpeg → /predict-file gagal.
 FROM python:3.11-slim-bookworm
 
+# build-essential: webrtcvad has no manylinux wheel → pip compiles C extension (needs gcc).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && ffmpeg -version | head -n 1
 
