@@ -3,10 +3,16 @@
 FROM python:3.11-slim-bookworm
 
 # build-essential: webrtcvad has no manylinux wheel → pip compiles C extension (needs gcc).
+# curl/unzip: Deno installer. Deno >=2: yt-dlp YouTube EJS (JS challenges); see https://github.com/yt-dlp/yt-dlp/wiki/EJS
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg build-essential \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg build-essential curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/* \
     && ffmpeg -version | head -n 1
+
+RUN curl -fsSL https://deno.land/install.sh | sh \
+    && install -m 755 /root/.deno/bin/deno /usr/local/bin/deno \
+    && deno --version
 
 WORKDIR /app
 COPY requirements.txt .
