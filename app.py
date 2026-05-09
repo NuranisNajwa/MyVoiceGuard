@@ -1227,12 +1227,37 @@ AI_MARKERS = [
     "vc", "ai-voice", "aivoice",
 ]
 
-def check_signature(path):
-    name = os.path.basename(path).lower()
+
+def _signature_scan_text(path: str) -> str:
+    """
+    Use only the user-visible filename/title for marker matching.
+    Avoids Windows basename quirks with 'Upload: ...' and reduces false hits in long news titles.
+    """
+    s = str(path or "").strip().replace("\\", "/")
+    base = os.path.basename(s).lower()
+    for prefix in ("upload:", "url:"):
+        if base.startswith(prefix):
+            base = base[len(prefix) :].strip()
+    return base
+
+
+def check_signature(path: str) -> bool:
+    name = _signature_scan_text(path)
     for marker in AI_MARKERS:
-        if marker in name:
-            print(f"[SIGNATURE] AI marker '{marker}' in filename")
-            return True
+        m = marker.lower()
+        if len(m) <= 5:
+            # Short tokens (fake, clone, tts, rvc, …): token boundaries so news titles
+            # like "…synthesis…" / "…microscope…" do not false-trigger; skip "faker…".
+            if m == "fake" and name.startswith("fake") and len(name) > len(m):
+                if str(name[len(m)]).isalpha():
+                    continue
+            if re.search(rf"(?<![a-z0-9]){re.escape(m)}(?![a-z0-9])", name):
+                print(f"[SIGNATURE] AI marker '{marker}' in filename (token match)")
+                return True
+        else:
+            if m in name:
+                print(f"[SIGNATURE] AI marker '{marker}' in filename")
+                return True
     return False
 
 
@@ -1402,6 +1427,9 @@ def process_audio(
             "time":       round(time.time() - start, 2),
             "source":     source_label,
             "result":     "FAKE",
+            "threshold_used": float(THRESHOLD_REAL),
+            "signature_based_fake": True,
+            "strict_framework_mode": bool(MV_STRICT_FRAMEWORK),
         }
 
     # Step 1b – live only: do not trust deepfake score when there is no usable speech
@@ -1562,8 +1590,9 @@ def process_audio(
     if pred_label is not None and classes and len(classes) > real_idx:
         real_class = classes[real_idx]
         pred_is_real = (pred_label == real_class) or (str(pred_label) == str(real_class))
-        # Segment majority: helps long YouTube where mean-argmax class disagrees with most trees
-        if not pred_is_real:
+        # Segment / hint heuristics (off in strict framework): train_model + RF decide class;
+        # multi-segment aggregation already handled inside model_predict_multisegment.
+        if not MV_STRICT_FRAMEWORK and not pred_is_real:
             if vote_real >= 0.55 and seg_mean >= 0.40 and n_seg >= 4:
                 pred_is_real = True
                 print(
@@ -1623,10 +1652,11 @@ def process_audio(
     )
     # endregion
 
-    # Guardrail: if RF aggregate leans FAKE strongly, never allow post-processing
-    # to keep/raise a REAL verdict (especially important for cloned uploads).
+    # Upload FAKE guardrail (disabled in strict framework): caps confidence below REAL
+    # when RF disagrees — useful for clone defence but overrides pure RF+threshold policy.
     if (
-        is_upload_source
+        not MV_STRICT_FRAMEWORK
+        and is_upload_source
         and not bool(pred_is_real)
         and (float(raw_prob_real) <= 0.62 or float(vote_real) <= 0.45)
     ):
@@ -1701,6 +1731,12 @@ def process_audio(
         "segment_count":      int(n_seg),
         "vote_real_fraction": round(float(vote_real), 4),
         "threshold_used":     float(round(threshold_used, 2)),
+        # Transparency: same signal as training pipeline (RF proba for REAL class).
+        "raw_prob_real":      round(float(raw_prob_real), 6),
+        "model_pred_label":   str(pred_label) if pred_label is not None else None,
+        "model_classes":      [str(c) for c in classes] if classes else [],
+        "strict_framework_mode": bool(MV_STRICT_FRAMEWORK),
+        "disable_librosa_features": os.environ.get("MV_DISABLE_LIBROSA_FEATURES", "0"),
     }
 
 def safe_remove(*paths):
