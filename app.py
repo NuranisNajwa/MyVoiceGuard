@@ -803,8 +803,20 @@ def model_predict_multisegment(wav_path, start_offset_sec=0.0):
         chunks = _segment_audio_chunks(y_full, sr)
         del y_full
         feats44 = [_features_from_audio_y(c, sr) for c in chunks]
-        out["features_for_speaker"] = np.mean(np.stack(feats44, axis=0), axis=0)
+        if not feats44:
+            out["error"] = "no_feature_segments"
+            return out
+        mean_vec = np.mean(np.stack(feats44, axis=0), axis=0)
+        out["features_for_speaker"] = mean_vec
         out["n_segments"] = len(feats44)
+        # If window-mean vector is unusable (silent decode / load glitch), fall back to
+        # same 44-dim path as train_model.py: one MFCC vector over first 30s (extract_features).
+        if float(np.linalg.norm(mean_vec.astype(np.float64))) < 1e-12:
+            print("[MODEL] segment mean features near-zero; falling back to extract_features(wav)")
+            try:
+                out["features_for_speaker"] = extract_features(wav_path)
+            except Exception as fe:
+                print(f"[MODEL] extract_features fallback failed: {fe}")
 
         classes = list(getattr(model, "classes_", []))
         out["classes"] = classes
@@ -871,11 +883,13 @@ def _model_predict_singlepass(features44):
     Returns (raw_prob_real[0..1], pred_label, classes, real_idx).
     """
     features44 = np.asarray(features44, dtype=np.float32).flatten()
-    # Prevent static outputs from invalid/empty feature vectors.
+    # Reject only truly unusable vectors (NaN/Inf / empty). Do not use std(features44)
+    # across 44 dims — MFCC+delta vectors can have small cross-dim spread while still
+    # being valid inputs to the trained RF+Scaler (was falsely tripping as "degenerate").
     if features44.size == 0 or not np.all(np.isfinite(features44)):
         raise RuntimeError("invalid feature vector for single-pass scoring")
-    if np.linalg.norm(features44) < 1e-6 or float(np.std(features44)) < 1e-7:
-        raise RuntimeError("degenerate feature vector for single-pass scoring")
+    if float(np.linalg.norm(features44.astype(np.float64))) < 1e-30:
+        raise RuntimeError("degenerate feature vector for single-pass scoring (near-zero norm)")
 
     classes = list(getattr(model, "classes_", []))
     if not classes:
@@ -1519,10 +1533,14 @@ def process_audio(
                 "[MODEL] multi-segment fallback -> single-pass predict_proba "
                 f"(reason error={mp.get('error') if isinstance(mp, dict) else None})"
             )
-            if np.linalg.norm(features) < 1e-9:
+            fn = lambda v: float(np.linalg.norm(np.asarray(v, dtype=np.float64).ravel()))
+            if fn(features) < 1e-12:
                 features = extract_features_for_predict(
                     wav_path, start_offset_sec=float(audio_start_sec or 0.0)
                 )
+            if fn(features) < 1e-12:
+                print("[MODEL] single-pass: using extract_features (30s MFCC) as last resort")
+                features = extract_features(wav_path)
             raw_prob_real, pred_label, classes, real_idx = _model_predict_singlepass(features)
             prob_real = max(0.0, min(100.0, raw_prob_real * 100.0))
             vote_real = raw_prob_real
@@ -1539,9 +1557,12 @@ def process_audio(
         prob_real = 0.0
         raw_prob_real = 0.5
         try:
+            _fn = lambda v: float(np.linalg.norm(np.asarray(v, dtype=np.float64).ravel()))
             features = extract_features_for_predict(
                 wav_path, start_offset_sec=float(audio_start_sec or 0.0)
             )
+            if _fn(features) < 1e-12:
+                features = extract_features(wav_path)
             try:
                 raw_prob_real, pred_label, classes, real_idx = _model_predict_singlepass(features)
                 prob_real = max(0.0, min(100.0, raw_prob_real * 100.0))
