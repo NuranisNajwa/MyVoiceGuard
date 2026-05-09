@@ -384,21 +384,38 @@ except ImportError:
     REQUESTS_OK = False
 
 
+def _mv_ytdlp_cookiefile_env_path():
+    """Path from MV_YTDLP_COOKIEFILE if set (existence checked by callers)."""
+    return (os.environ.get("MV_YTDLP_COOKIEFILE") or "").strip()
+
+
 def _yt_dlp_youtube_client_profiles():
     """
     Ordered player_client lists to try when YouTube returns bot / sign-in errors.
     yt-dlp picks the first working client; order matters. Updated as YouTube changes APIs.
+
+    When MV_YTDLP_COOKIEFILE points at an existing file, prefer web/mweb first: yt-dlp skips
+    android/ios with cookiefile ("does not support cookies"), so those profiles waste retries.
     """
     raw = (os.environ.get("MV_YTDLP_PLAYER_CLIENTS") or "").strip()
     if raw:
-        # e.g. "android,web,tv_embedded" -> one profile [["android","web","tv_embedded"]]
+        # e.g. "web,mweb,android" -> one profile [["web","mweb","android"]]
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if parts:
             return [parts]
+    cookie_p = _mv_ytdlp_cookiefile_env_path()
+    if cookie_p and os.path.isfile(cookie_p):
+        return [
+            ["web", "mweb"],
+            ["mweb", "web"],
+            ["web"],
+            ["android", "web"],
+            ["ios", "mweb"],
+        ]
     return [
         ["android", "ios", "web", "mweb"],
         ["android", "web"],
-        ["tv_embedded", "web"],
+        ["web", "mweb"],
         ["ios", "mweb"],
         ["mweb", "android"],
         ["web"],
@@ -426,11 +443,27 @@ def _prepare_ytdlp_cookiefile(source_path: str, uid_suffix: str):
             "Check Render Secret File name → use /etc/secrets/<that_filename>."
         )
     try:
+        sz_on_disk = os.path.getsize(source_path)
+    except OSError as e:
+        return None, f"Cannot stat cookie file: {e}"
+    print(f"[URL] MV_YTDLP_COOKIEFILE: path={source_path!r} size_bytes={sz_on_disk}")
+    if sz_on_disk == 0:
+        return None, (
+            "Cookie file on the server is 0 bytes (nothing was uploaded or Secret File is blank). "
+            "Render → Environment → Secret Files: upload your exported cookies.txt again, "
+            "confirm the file opens on your PC and shows lines starting with # Netscape…, "
+            "Save, then Manual Deploy."
+        )
+    try:
         raw = open(source_path, "rb").read()
     except OSError as e:
         return None, f"Cannot read cookie file: {e}"
     if not raw.strip():
-        return None, "Cookie file is empty."
+        return None, (
+            f"Cookie file is empty or whitespace-only after read ({len(raw)} bytes). "
+            "Re-export with Get cookies.txt LOCALLY (Format: Netscape → Export), "
+            "re-upload Secret File on Render, redeploy."
+        )
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
     text = raw.decode("utf-8", errors="replace")
@@ -2310,16 +2343,21 @@ def predict_url():
                 )
                 if not downloaded:
                     if yt_bot or _is_youtube_bot_block_message(dl_err or ""):
+                        err_msg = (
+                            "YouTube blocked this server (sign-in / bot check). "
+                            "Easiest: download the video on your PC, then use Upload. "
+                            "Advanced: export cookies.txt (see yt-dlp wiki), upload to a "
+                            "private path on the server and set env MV_YTDLP_COOKIEFILE to that path."
+                        )
+                        if src_cookie:
+                            err_msg += (
+                                " You already use MV_YTDLP_COOKIEFILE: if logs say cookies are "
+                                "invalid/rotated, close YouTube in the browser, open youtube.com once, "
+                                "export Netscape cookies immediately, replace the Render Secret File, "
+                                "Manual Deploy, then retry."
+                            )
                         return jsonify(
-                            {
-                                "error": (
-                                    "YouTube blocked this server (sign-in / bot check). "
-                                    "Easiest: download the video on your PC, then use Upload. "
-                                    "Advanced: export cookies.txt (see yt-dlp wiki), upload to a "
-                                    "private path on the server and set env MV_YTDLP_COOKIEFILE to that path."
-                                ),
-                                "youtube_bot_block": True,
-                            }
+                            {"error": err_msg, "youtube_bot_block": True}
                         ), 503
                     return jsonify(
                         {
