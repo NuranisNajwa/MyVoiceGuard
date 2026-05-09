@@ -478,7 +478,31 @@ async function runFinalAnalysis() {
 
         if (!response.ok) {
             const body = await response.text();
-            throw new Error(`Backend ${response.status}: ${body}`);
+            let detail = body;
+            try {
+                const j = JSON.parse(body);
+                if (j.cookies_file_invalid && j.error) {
+                    detail =
+                        "Fail cookies di Render bukan format Netscape yang yt-dlp perlukan.\n\n" +
+                        "1) Buka Get cookies.txt LOCALLY → Export Format: Netscape.\n" +
+                        "2) Export (bukan JSON).\n" +
+                        "3) Semak fail di PC: baris pertama mesti '# Netscape HTTP Cookie File' atau '# HTTP Cookie File'.\n" +
+                        "4) Ganti Secret File di Render, deploy semula.\n\n" +
+                        j.error;
+                } else if (j.youtube_bot_block && j.error) {
+                    detail =
+                        "YouTube menghalang pelayan (semakan bot / IP pusat data). " +
+                        "Cara paling mudah: muat turun video di PC anda, kemudian guna Upload.\n\n" +
+                        "Untuk URL terus dari Render: tetapkan env MV_YTDLP_COOKIEFILE kepada laluan cookies.txt " +
+                        "(lihat wiki yt-dlp: Exporting YouTube cookies).\n\n" +
+                        j.error;
+                } else if (j.error) {
+                    detail = j.error;
+                }
+            } catch (_) {
+                /* keep raw body */
+            }
+            throw new Error(`Backend ${response.status}: ${detail}`);
         }
 
         const data = await response.json();
